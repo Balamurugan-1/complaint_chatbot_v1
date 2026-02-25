@@ -1,40 +1,83 @@
 import re
-from sqlalchemy import or_
+from typing import Iterable, List, Optional
+
 from . import models
 
-def extract_fields(message: str, machine_list: list, location_list: list):
-    message_lower = message.lower()
 
-    extracted = {
-        "machine_name": None,
-        "location": None,
-        "description": message,
-    }
+TYPE_MAPPING = {
+    "hardware": 1,
+    "process": 2,
+    "electrical": 3,
+}
 
-    for machine in machine_list:
-        if machine.lower() in message_lower:
-            extracted["machine_name"] = machine
-            break
-
-    for location in location_list:
-        if location.lower() in message_lower:
-            extracted["location"] = location
-            break
-
-    return extracted
+TYPE_SYNONYMS = {
+    "hardware": {"hardware", "mechanical", "machine", "part"},
+    "process": {"process", "workflow", "procedure", "operation"},
+    "electrical": {"electrical", "electric", "power", "wiring"},
+}
 
 
-def extract_machine_db(message, db):
-    words = re.findall(r'\w+', message.lower())
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
 
-    conditions = [
-        models.Resources.name.ilike(f"%{word}%")
-        for word in words
-    ]
 
-    if not conditions:
-        return []
+def _tokenize(value: str) -> set:
+    return set(re.findall(r"[a-z0-9]+", value.lower()))
 
-    matched = db.query(models.Resources).filter(or_(*conditions)).all()
 
-    return matched
+def extract_machine_candidates(message: str, machines: Iterable[models.Resources]) -> List[models.Resources]:
+    """Return unique machine matches using exact-name and token-overlap heuristics."""
+    msg_norm = _normalize_text(message)
+    msg_tokens = _tokenize(message)
+
+    exact_matches: List[models.Resources] = []
+    partial_matches: List[models.Resources] = []
+
+    for machine in machines:
+        name_norm = _normalize_text(machine.name or "")
+        if not name_norm:
+            continue
+
+        exact_pattern = rf"\b{re.escape(name_norm)}\b"
+        if re.search(exact_pattern, msg_norm):
+            exact_matches.append(machine)
+            continue
+
+        name_tokens = _tokenize(name_norm)
+        if name_tokens and len(name_tokens.intersection(msg_tokens)) >= 1:
+            partial_matches.append(machine)
+
+    if exact_matches:
+        return exact_matches
+
+    unique = []
+    seen = set()
+    for machine in partial_matches:
+        if machine.machid not in seen:
+            seen.add(machine.machid)
+            unique.append(machine)
+    return unique
+
+
+def narrow_by_location(message: str, machines: Iterable[models.Resources]) -> List[models.Resources]:
+    msg_norm = _normalize_text(message)
+    narrowed = []
+
+    for machine in machines:
+        location_norm = _normalize_text(machine.location or "")
+        if location_norm and location_norm in msg_norm:
+            narrowed.append(machine)
+
+    return narrowed
+
+
+def parse_issue_type(message: str) -> Optional[int]:
+    msg_tokens = _tokenize(message)
+    if not msg_tokens:
+        return None
+
+    for canonical, aliases in TYPE_SYNONYMS.items():
+        if msg_tokens.intersection(aliases):
+            return TYPE_MAPPING[canonical]
+
+    return None
